@@ -402,7 +402,7 @@ def scatter_pies(ax, x, y, percents, radius=0.35, labels=None,
     return handles
 
 
-def solve_V_per_slice(adata, pd_B, lam=10, n_top=2000, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, preprocess=True):
+def solve_V_per_slice(adata, pd_B, lam=10, n_top=2000, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, preprocess=True, return_obj=False):
     # stop
     if preprocess:
         import scipy.sparse as sp
@@ -452,9 +452,9 @@ def solve_V_per_slice(adata, pd_B, lam=10, n_top=2000, niter_max=1e3, tol=1e-5, 
     L = lam*L
     B = pd_B_sub.to_numpy().T
     X = adata_sub.X.T
-    return solve_V_universal(X,B,L,niter_max=niter_max, tol=tol, eta = eta, verbose=verbose)
+    return solve_V_universal(X,B,L,niter_max=niter_max, tol=tol, eta = eta, verbose=verbose, return_obj=return_obj)
 
-def solve_V_universal(X,B,L, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, V0=None):
+def solve_V_universal(X,B,L, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, V0=None, return_obj=False):
 
     print(X.T.shape)
     print(B.shape)
@@ -517,7 +517,13 @@ def solve_V_universal(X,B,L, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, 
         f_prev = f_curr
 
     print('stopped after iteration #'+str(it))
-    return V
+    if return_obj == False:
+        return V
+    else:
+        R = X - B @ V.T
+        R = np.asarray(R)
+        return V, objective(V), np.sum(R*R)
+        
 
 
 
@@ -525,7 +531,7 @@ def solve_V_universal(X,B,L, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, 
 import anndata as ad
 import ot
 
-def solve_V_all_slices(adata_group, pd_B, lam=10, mu=1, n_top=2000, time=None, outer_max=5, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, preprocess=True):
+def solve_V_all_slices(adata_group, pd_B, lam=10, mu=1, n_top=2000, time=None, outer_max=5, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, preprocess=True, coupling=None):
     # stop
     n_times = len(adata_group)
     n_spots = [0]
@@ -562,6 +568,8 @@ def solve_V_all_slices(adata_group, pd_B, lam=10, mu=1, n_top=2000, time=None, o
         sc.pp.highly_variable_genes(adata, n_top_genes=n_top)
         mask = adata.var['highly_variable']
         gene_names = adata.var_names[mask]
+    else:
+        gene_names = adata.var_names
 
 
     print(pd_B.columns)
@@ -605,8 +613,10 @@ def solve_V_all_slices(adata_group, pd_B, lam=10, mu=1, n_top=2000, time=None, o
             a = np.ones(adata_group[i].obs.shape[0])/adata_group[i].obs.shape[0]
             b = np.ones(adata_group[i+1].obs.shape[0])/adata_group[i+1].obs.shape[0]
             C = scipy.spatial.distance.cdist(V_init[i], V_init[i+1], metric='cosine')
-
-            pi[i] = ot.sinkhorn(a,b,C, reg=1e-2)
+            if coupling is None:
+                pi[i] = ot.sinkhorn(a,b,C, reg=1e-2)
+            else:
+                pi[i] = coupling[i]
 
             norm1 = np.linalg.norm(V_init[i],axis=1)
             norm2 = np.linalg.norm(V_init[i+1],axis=1)
