@@ -9,7 +9,7 @@ You can install the released version of ATLIS from Github with the following cod
 
 How to cite`ATLIS`
 -------------------
-
+Wenjun Zhao# and Ying Ma#, ATLIS: Anchored Tissue Landscapes in an Interpretable Latent Space. 2026
 
 How to use `ATLIS`
 -------------------
