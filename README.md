@@ -1,5 +1,5 @@
 # ATLIS: Anchored Tissue Landscape in Interpretable Space
-![](Figure1.png)
+![](Flowchart.jpeg)
 
 ATLIS is a xxxxx
 
