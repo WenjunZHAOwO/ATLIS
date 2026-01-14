@@ -1,6 +1,9 @@
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, Matern, WhiteKernel, ConstantKernel
+import sys
+import FRLC
+import torch
 
 def gp_impute_spots(
     train_coords,          # (n_train, 2) array of [x, y]
@@ -180,3 +183,305 @@ def gp_impute_spots_cross_slice(
         Vtest = Vtest / s
 
     return (Vtest, V_std) if return_std else Vtest
+
+
+
+
+
+import numpy as np
+import ot
+from ot.utils import dist
+import matplotlib.pyplot as plt
+import numpy as np
+import ot
+from ot.utils import dist
+import matplotlib.pyplot as plt
+
+
+def classical_mds(D, n_components=2):
+    """
+    Classical MDS from a distance matrix D.
+
+    Parameters
+    ----------
+    D : (N, N) array
+        Distance matrix (not squared).
+    n_components : int
+        Embedding dimension.
+
+    Returns
+    -------
+    X : (N, n_components) array
+        Embedded coordinates.
+    """
+    D = np.asarray(D)
+    N = D.shape[0]
+    # Double-centering
+    J = np.eye(N) - np.ones((N, N)) / N
+    B = -0.5 * J @ (D ** 2) @ J
+    eigvals, eigvecs = np.linalg.eigh(B)
+    idx = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+    eigvals_pos = np.clip(eigvals[:n_components], a_min=0, a_max=None)
+    X = eigvecs[:, :n_components] * np.sqrt(eigvals_pos[np.newaxis, :])
+    return X
+
+
+def impute_slice_fgw_barycenter(
+    X0,
+    Y0,
+    X1,
+    Y1,
+    t=0.5,
+    N_bary=None,
+    p0=None,
+    p1=None,
+    alpha=0.5,
+    n_components=2,
+    lambdas=None,
+    loss_fun="square_loss",
+    symmetric=True,
+    max_iter=100,
+    tol=1e-9,
+    stop_criterion="barycenter",
+    warmstartT=False,
+    armijo=False,
+    verbose=False,
+    random_state=None,
+    pd_B=None,
+    Y_is_proportion=False,
+    **kwargs,
+):
+    """
+    fGW barycenter imputation with optional projection to gene space.
+
+    If Y_is_proportion=True:
+        - Y0, Y1, and the barycenter features are treated as proportions
+        - barycenter features are projected via pd_B (cell type -> genes)
+
+    If Y_is_proportion=False:
+        - Y0, Y1 are already gene expression
+        - output genes are reordered to pd_B.columns if provided
+    """
+    import numpy as np
+    import ot
+    from scipy.spatial.distance import cdist as dist
+
+    X0 = np.asarray(X0)
+    X1 = np.asarray(X1)
+    Y0 = np.asarray(Y0)
+    Y1 = np.asarray(Y1)
+
+    assert X0.shape[0] == Y0.shape[0]
+    assert X1.shape[0] == Y1.shape[0]
+
+    n0, n1 = X0.shape[0], X1.shape[0]
+    if N_bary is None:
+        N_bary = int(np.round(0.5 * (n0 + n1)))
+
+    # --- structural costs
+    C0 = dist(X0, X0, metric="sqeuclidean")
+    C1 = dist(X1, X1, metric="sqeuclidean")
+    Cs = [C0, C1]
+    Ys = [Y0, Y1]
+
+    # --- measures
+    if p0 is None:
+        p0 = ot.utils.unif(n0)
+    if p1 is None:
+        p1 = ot.utils.unif(n1)
+    ps = [p0, p1]
+
+    # --- temporal weights
+    if lambdas is None:
+        lambdas = [1.0 - t, t]
+
+    # --- fGW barycenter
+    X_bar_feat, C_bar, log = ot.gromov.fgw_barycenters(
+        N=N_bary,
+        Ys=Ys,
+        Cs=Cs,
+        ps=ps,
+        lambdas=lambdas,
+        alpha=alpha,
+        fixed_structure=False,
+        fixed_features=False,
+        p=None,
+        loss_fun=loss_fun,
+        armijo=armijo,
+        symmetric=symmetric,
+        max_iter=max_iter,
+        tol=tol,
+        stop_criterion=stop_criterion,
+        warmstartT=warmstartT,
+        verbose=verbose,
+        log=True,
+        init_C=None,
+        init_X=None,
+        random_state=random_state,
+        **kwargs,
+    )
+
+    # --- embed barycenter geometry
+    D_bar = np.sqrt(np.maximum(C_bar, 0.0))
+    X_bar_spatial = classical_mds(D_bar, n_components=n_components)
+
+    # =========================================================
+    # NEW: project to gene expression if requested
+    # =========================================================
+    if Y_is_proportion:
+        if pd_B is None:
+            raise ValueError("pd_B must be provided when Y_is_proportion=True.")
+
+        # pd_B: (n_cell_types, n_genes)
+        X_bar_gene = X_bar_feat @ pd_B.values
+
+        return (
+            X_bar_spatial,
+            pd.DataFrame(X_bar_gene, columns=pd_B.columns),
+            X_bar_feat,
+            C_bar,
+            log,
+        )
+
+    # already gene expression → reorder columns if pd_B given
+    if pd_B is not None:
+        if X_bar_feat.shape[1] != pd_B.shape[1]:
+            raise ValueError("Gene dimension mismatch with pd_B.")
+        X_bar_feat = pd.DataFrame(X_bar_feat, columns=pd_B.columns)
+
+    return X_bar_spatial, X_bar_feat, C_bar, log
+
+
+
+import numpy as np
+import ot
+from scipy.spatial.distance import cdist
+
+
+import numpy as np
+import pandas as pd
+import ot
+from scipy.spatial.distance import cdist
+
+
+def impute_slice_gw_with_projection(
+    coords_prev, X_prev,
+    coords_t,
+    coords_next, X_next,
+    alpha=0.5,
+    eps=5e-3,
+    pd_B=None,
+    X_is_proportion=False,
+    solver='fgw',
+    coords_is_dist= False,
+):
+    """
+    GW-based full-slice imputation.
+    Optionally projects proportions to gene expression using pd_B.
+
+    Parameters
+    ----------
+    coords_prev, coords_t, coords_next : (N, d)
+    X_prev, X_next : (N_prev, p) and (N_next, p)
+        Either gene expression or cell-type proportions.
+    alpha : float
+        Time interpolation weight.
+    eps : float
+        Entropic GW regularization.
+    pd_B : pandas.DataFrame or None
+        Rows = cell types, columns = genes.
+    X_is_proportion : bool
+        True if X_* are proportions over pd_B.index.
+
+    Returns
+    -------
+    X_t_hat : (N_t, n_genes) or (N_t, p)
+    """
+
+    # --- GW coupling
+    def _gw(coords_t, coords_s, coords_is_dist):
+        
+        Ct = cdist(coords_t, coords_t, metric="sqeuclidean")
+        if coords_is_dist == False:
+            Cs = cdist(coords_s, coords_s, metric="sqeuclidean")
+            C = cdist(coords_s, coords_t, metric="sqeuclidean")
+        else:
+            Cs = coords_s
+            C = np.zeros((Cs.shape[0], Ct.shape[0]))
+        Cs = Cs/Ct.max()
+        Ct = Ct/Ct.max()
+        
+        pt = np.ones(Ct.shape[0]) / Ct.shape[0]
+        ps = np.ones(Cs.shape[0]) / Cs.shape[0]
+        # C = cdist(coords_s, coords_t, metric="sqeuclidean")
+        if solver == 'fgw':
+            G = ot.gromov.entropic_gromov_wasserstein(
+                Ct, Cs, pt, ps, epsilon=eps, loss_fun="square_loss"
+            )
+            if np.std(G.ravel()) < 1e-10:
+                print('degenerate coupling...switch to lowrank')
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                G, _ = FRLC.FRLC_opt(torch.tensor(C).to(device), A = torch.tensor(Cs).to(device), B = torch.tensor(Ct).to(device), alpha=1.0, device=device, r=100, min_iter=100, max_iter=100,
+                                    max_inneriters_balanced=300,
+                                    max_inneriters_relaxed=300,
+                                    min_iterGW = 100,
+                                    Wasserstein = False,
+                                    FGW = True,
+                                    returnFull=True,
+                                    printCost=False
+                )
+                G = G.cpu().detach().numpy()
+                G = G.T
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            G, _ = FRLC.FRLC_opt(torch.tensor(C).to(device), A = torch.tensor(Cs).to(device), B = torch.tensor(Ct).to(device), alpha=1.0, device=device, r=100, min_iter=100, max_iter=100,
+                                    max_inneriters_balanced=300,
+                                    max_inneriters_relaxed=300,
+                                    min_iterGW = 100,
+                                    Wasserstein = False,
+                                    FGW = True,
+                                    returnFull=True,
+                                    printCost=False
+            )
+            G = G.cpu().detach().numpy()
+            G = G.T
+        return G / G.sum(axis=1, keepdims=True)
+
+    
+    W_prev = _gw(coords_t, coords_prev, coords_is_dist)
+    X_prev = np.asarray(X_prev, float)
+    X_t_hat = W_prev @ X_prev
+    if not coords_next is None:
+
+        W_next = _gw(coords_t, coords_next, coords_is_dist)
+        X_next = np.asarray(X_next, float)
+
+        X_t_hat = (1 - alpha) * (W_prev @ X_prev) + alpha * (W_next @ X_next)
+
+    # --- If proportions → genes
+    if X_is_proportion:
+        if pd_B is None:
+            raise ValueError("pd_B must be provided when X_is_proportion=True.")
+
+        # pd_B: (n_ct, n_genes)
+        B = pd_B.values
+        X_t_prop = X_t_hat.copy()
+        X_t_hat = X_t_hat @ B   # (N_t, n_genes)
+
+        return pd.DataFrame(
+            X_t_hat,
+            columns=pd_B.columns
+        ), X_t_prop
+
+    # --- If already genes, just reorder to pd_B.columns if provided
+    if pd_B is not None:
+        if X_t_hat.shape[1] != pd_B.shape[1]:
+            raise ValueError("Gene dimension mismatch with pd_B columns.")
+        return pd.DataFrame(
+            X_t_hat,
+            columns=pd_B.columns
+        )
+
+    return X_t_hat
