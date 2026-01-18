@@ -1,5 +1,5 @@
 # ATLIS: Anchored Tissue Landscape in Interpretable Space
-![](Flowchart.jpeg)
+![](Flowchart.png)
 
 ATLIS is an interpretable spatial–temporal modeling framework in which cell-type composition defines an interpretable latent space that anchors spatial organization and temporal evolution in multi-slice spatial transcriptomics data.
 
