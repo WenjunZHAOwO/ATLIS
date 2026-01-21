@@ -5,15 +5,15 @@ ATLIS is an interpretable spatial–temporal modeling framework in which cell-ty
 
 Installation
 ------------
-You can install the released version of ATLIS from Github with the following code, for more installation details or solutions that might solve related issues (specifically MacOS system) see the [link]().
+You can install the released version of ATLIS from Github with the following code:
+
+`git clone https://github.com/WenjunZHAOwO/ATLIS.git`
 
 How to cite`ATLIS`
 -------------------
 Wenjun Zhao# and Ying Ma#, ATLIS: Anchored Tissue Landscapes in an Interpretable Latent Space. 2026
 
-How to use `ATLIS`
--------------------
-Details in [Tutorial](https://)
+
 
 
 
