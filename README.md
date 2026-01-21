@@ -9,6 +9,11 @@ You can install the released version of ATLIS from Github with the following cod
 
 `git clone https://github.com/WenjunZHAOwO/ATLIS.git`
 
+Example usage
+------------
+[Synthetic example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Synthetic.ipynb)
+
+
 How to cite`ATLIS`
 -------------------
 Wenjun Zhao# and Ying Ma#, ATLIS: Anchored Tissue Landscapes in an Interpretable Latent Space. 2026
