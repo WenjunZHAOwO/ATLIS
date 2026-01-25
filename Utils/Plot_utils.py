@@ -1005,63 +1005,7 @@ def compute_transition_tables_from_couplings(
     return tables, labels_out
 
 
-def plot_transition_table(
-    table_df,
-    ax=None,
-    title=None,
-    cmap="viridis",
-    show_values=False,
-    value_fmt=".2f",
-    rotate_xticks=45,
-    vmin=None,
-    vmax=None,
-):
-    """
-    Plot a transition table (pd.DataFrame) as a heatmap using matplotlib (no seaborn).
-    """
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 5))
-    else:
-        fig = ax.figure
 
-    M = table_df.to_numpy()
-    im = ax.imshow(M, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
-
-    ax.set_xticks(np.arange(table_df.shape[1]))
-    ax.set_yticks(np.arange(table_df.shape[0]))
-    ax.set_xticklabels(table_df.columns, rotation=rotate_xticks, ha="right")
-    ax.set_yticklabels(table_df.index)
-
-    ax.set_xlabel("Target (t+1)")
-    ax.set_ylabel("Source (t)")
-    if title is not None:
-        ax.set_title(title)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.set_ylabel("Mass / Probability", rotation=90)
-
-    if show_values:
-        for i in range(table_df.shape[0]):
-            for j in range(table_df.shape[1]):
-                ax.text(j, i, format(M[i, j], value_fmt), ha="center", va="center")
-
-    ax.set_xlim(-0.5, table_df.shape[1] - 0.5)
-    ax.set_ylim(table_df.shape[0] - 0.5, -0.5)
-    return ax
-
-
-# -------------------------
-# Example usage:
-# -------------------------
-# tables, labs = compute_transition_tables_from_couplings(
-#     adata_group, couplings,
-#     celltype_key="annotation",
-#     keep_labels=["RGC", "NeuB", "GlioB"],
-#     others_label="Others",
-#     normalize="row",
-# )
-# ax = plot_transition_table(tables[0], title="t0 → t1 (row-normalized)")
-# plt.show()
 
 
 import numpy as np
@@ -1375,6 +1319,7 @@ def _sorted_scatter(ax, x, y, c, s=18, cmap="inferno", alpha=0.95, vmin=None, vm
     )
     return sc
 
+
 def plot_mass_transport_heatmap(
     adata_insamp,
     V,
@@ -1384,7 +1329,6 @@ def plot_mass_transport_heatmap(
     y_gap=500,
     y_scale=0.3,
     figsize=(8, 7),
-    # NEW:
     ax=None,
     fig=None,
     tight_layout=True,
@@ -1394,15 +1338,17 @@ def plot_mass_transport_heatmap(
     source_mass_source="obs",      # {"obs","V_argmax"}
     labels=None,                   # list of V column names if using V_argmax with str
     unit_mass="per_spot",          # {"per_spot","probability"}
-    # edges (optional)
+    # edges (barycentric projection)
     show_edges=True,
-    min_weight=0.3,
-    max_edges_per_pair=1000,
-    edge_alpha=0.25,
-    edge_lw=0.4,
-    edge_same_celltype=False,
+    n_sources_show=300,            # number of source points to draw arrows from (None -> all)
+    sources_rank_by="mass",        # {"mass","peakedness"} for choosing which sources to draw
+    edge_alpha=0.35,
+    edge_lw=0.6,
+    edge_scale=1.0,                # multiply arrow displacement
+    edge_same_celltype=False,      # keep only arrows whose source and target-expected celltype match
     edge_celltype_source="obs",    # {"obs","V_argmax"}
-    edge_celltype=None,
+    edge_celltype=None,            # if set, only draw arrows whose source celltype == this
+    seed=0,                        # used only for tie-breaking in ranking
     # heatmap style
     cmap="inferno",
     s=18,
@@ -1416,6 +1362,19 @@ def plot_mass_transport_heatmap(
     y_key="y",
     eps=1e-12,
 ):
+    """
+    Plot stacked slices with a transported-mass heatmap and (optionally) barycentric-projection edges.
+
+    Heatmap: colors by transported mass m_t (seeded at t_start) propagated via row-stochastic P from pi.
+    Edges: for each source i at time t, draw an arrow to the barycentric projection:
+              y_bar(i) = sum_j P_ij * y_j
+          using the *transformed/stacked* coordinates (so arrows align with the plot).
+
+    Requires (already in your codebase):
+      - build_centered_stacked_coords(adatas, y_gap, y_scale, x_key, y_key, shift_dir)
+      - _row_stochastic_from_pi(Pi, eps)
+    """
+    rng = np.random.default_rng(seed)
 
     if source_celltype is None:
         raise ValueError("Pass source_celltype (e.g. 'Somite') to seed mass at t_start.")
@@ -1429,7 +1388,6 @@ def plot_mass_transport_heatmap(
     # Subset time window
     adatas = [adata_insamp[t] for t in range(t_start, t_end + 1)]
     Vs = [np.asarray(V[t]) for t in range(t_start, t_end + 1)]
-    n_time = len(adatas)
 
     # ---- seed mass at first slice in this window (idx=0 corresponds to t_start)
     ad0 = adatas[0]
@@ -1468,26 +1426,29 @@ def plot_mass_transport_heatmap(
 
     masses = [m]
 
-    # ---- propagate within window using global pi indices
+    # ---- propagate within window using global pi indices (row-stochastic P)
     for t in range(t_start, t_end):
-        Pi = np.asarray(pi[t]/pi[t].sum(), dtype=float)
+        Pi = np.asarray(pi[t], dtype=float)
+        Pi_sum = Pi.sum()
+        if Pi_sum <= eps:
+            raise ValueError(f"pi[{t}] has non-positive total mass.")
+        Pi = Pi / Pi_sum
+
         n_src = adata_insamp[t].n_obs
         n_tgt = adata_insamp[t + 1].n_obs
         if Pi.shape != (n_src, n_tgt):
-            raise ValueError(
-                f"pi[{t}] has shape {Pi.shape}, expected {(n_src, n_tgt)}."
-            )
+            raise ValueError(f"pi[{t}] has shape {Pi.shape}, expected {(n_src, n_tgt)}.")
+
         P = _row_stochastic_from_pi(Pi, eps=eps)
         masses.append(np.asarray(masses[-1] @ P).ravel())
 
-    # ---- your coordinate transform + concatenation
+    # ---- coordinate transform + concatenation
     coords_transformed, x_all, y_all = build_centered_stacked_coords(
-        adatas, y_gap=y_gap, y_scale=y_scale, x_key=x_key, y_key=y_key, shift_dir='x'
+        adatas, y_gap=y_gap, y_scale=y_scale, x_key=x_key, y_key=y_key, shift_dir="x"
     )
 
     # ---- concatenate masses for single scatter call
     m_all = np.concatenate(masses, axis=0)
-
     if vmax is None:
         vmax = float(np.max(m_all)) if np.max(m_all) > 0 else 1.0
 
@@ -1495,24 +1456,23 @@ def plot_mass_transport_heatmap(
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
-        # if caller passed an ax, use it; get fig from it unless explicitly passed
         if fig is None:
             fig = ax.figure
 
-
     sc = _sorted_scatter(
-        ax,
-        x_all,
-        y_all,
-        m_all,
+        x=x_all,
+        y=y_all,
+        c=m_all,
         s=s,
+        ax=ax,
         cmap=cmap,
         alpha=alpha,
         vmin=vmin,
         vmax=vmax,
+        # linewidths=0,
     )
 
-    # label each slice roughly at its min-x/min-y
+    # label each slice
     for idx, XY in enumerate(coords_transformed):
         ax.text(
             float(np.min(XY[:, 0])),
@@ -1523,7 +1483,7 @@ def plot_mass_transport_heatmap(
             va="top",
         )
 
-    # ---- optional edges (uses same transformed coords)
+    # ---- barycentric-projection edges
     if show_edges:
         def _types_for_edge_filter(global_t):
             if edge_celltype_source == "V_argmax":
@@ -1541,43 +1501,92 @@ def plot_mass_transport_heatmap(
             edge_type = labels.index(edge_celltype)
 
         for local_idx, global_t in enumerate(range(t_start, t_end)):
-            XY0 = coords_transformed[local_idx]
-            XY1 = coords_transformed[local_idx + 1]
-            x0, y0 = XY0[:, 0], XY0[:, 1]
-            x1, y1 = XY1[:, 0], XY1[:, 1]
+            # transformed coordinates for this displayed pair
+            XY0 = coords_transformed[local_idx]       # (n_src, 2) in displayed coordinates
+            XY1 = coords_transformed[local_idx + 1]   # (n_tgt, 2) in displayed coordinates
 
-            Pi = np.asarray(pi[global_t]/pi[global_t].sum(), dtype=float)
-            P = _row_stochastic_from_pi(Pi, eps=eps)
-            m_t = np.asarray(masses[local_idx]).ravel()
-            F = m_t[:, None] * P
-
-            flat = F.ravel()
-            if flat.size == 0:
+            # build row-stochastic P for this transition
+            Pi = np.asarray(pi[global_t], dtype=float)
+            Pi_sum = Pi.sum()
+            if Pi_sum <= eps:
                 continue
+            Pi = Pi / Pi_sum
+            P = _row_stochastic_from_pi(Pi, eps=eps)
 
-            cand = np.where(flat >= min_weight)[0]
-            if cand.size == 0:
-                kk = min(max_edges_per_pair, flat.size)
-                cand = np.argpartition(flat, -kk)[-kk:]
+            n_src, n_tgt = P.shape
+            if XY0.shape[0] != n_src or XY1.shape[0] != n_tgt:
+                raise ValueError(
+                    f"Coordinate mismatch at t={global_t}: "
+                    f"P={P.shape}, XY0={XY0.shape}, XY1={XY1.shape}"
+                )
 
-            kk = min(max_edges_per_pair, cand.size)
-            top = cand[np.argpartition(flat[cand], -kk)[-kk:]]
-            top = top[np.argsort(flat[top])[::-1]]
-
-            n_tgt = F.shape[1]
-            src = top // n_tgt
-            tgt = top % n_tgt
+            m_t = np.asarray(masses[local_idx]).ravel()
+            if m_t.size != n_src:
+                raise ValueError("Mass vector size mismatch with P rows.")
 
             src_types = _types_for_edge_filter(global_t)
             tgt_types = _types_for_edge_filter(global_t + 1)
 
-            for i, j in zip(src, tgt):
-                if edge_same_celltype and src_types[i] != tgt_types[j]:
-                    continue
-                if edge_type is not None:
-                    if src_types[i] != edge_type and tgt_types[j] != edge_type:
+            # choose candidate sources
+            src_all = np.arange(n_src)
+
+            # optional: only show sources of a specific type
+            if edge_type is not None:
+                src_all = src_all[src_types == edge_type]
+            if src_all.size == 0:
+                continue
+
+            # rank sources for visualization
+            if sources_rank_by == "mass":
+                scores = m_t[src_all]
+            elif sources_rank_by == "peakedness":
+                scores = P[src_all].max(axis=1)
+            else:
+                raise ValueError("sources_rank_by must be 'mass' or 'peakedness'.")
+
+            if n_sources_show is not None:
+                n_show = int(n_sources_show)
+                n_show = max(1, min(n_show, src_all.size))
+                # break ties deterministically but non-pathologically
+                jitter = 1e-15 * rng.random(src_all.size)
+                pick = np.argpartition(scores + jitter, -n_show)[-n_show:]
+                src_sel = src_all[pick]
+            else:
+                src_sel = src_all
+
+            # barycentric target coordinates for selected sources:
+            # y_bar(i) = sum_j P_ij * XY1[j]
+            # shape: (len(src_sel), 2)
+            Ybar = P[src_sel] @ XY1
+
+            # optionally, barycentric "type" (argmax of expected target type)
+            if edge_same_celltype:
+                # need target types to be numeric to compare; if obs strings, compare strings
+                # compute a soft vote for each target-type label:
+                # simplest: take argmax target index (still okay here for type only)
+                j_star = P[src_sel].argmax(axis=1)
+                tgt_type_bar = tgt_types[j_star]
+            else:
+                tgt_type_bar = None
+
+            for idx_i, i in enumerate(src_sel):
+                if edge_same_celltype:
+                    if src_types[i] != tgt_type_bar[idx_i]:
                         continue
-                ax.plot([x0[i], x1[j]], [y0[i], y1[j]], alpha=edge_alpha, linewidth=edge_lw, color='gray')
+
+                x0, y0 = XY0[i, 0], XY0[i, 1]
+                x1, y1 = Ybar[idx_i, 0], Ybar[idx_i, 1]
+
+                dx = (x1 - x0) * edge_scale
+                dy = (y1 - y0) * edge_scale
+
+                # draw as an arrow (quiver-like using annotate for consistent style)
+                ax.annotate(
+                    "",
+                    xy=(x0 + dx, y0 + dy),
+                    xytext=(x0, y0),
+                    arrowprops=dict(arrowstyle="-|>", lw=edge_lw, alpha=edge_alpha, color="gray"),
+                )
 
     ax.set_aspect("equal")
     ax.axis("off")
@@ -1588,10 +1597,343 @@ def plot_mass_transport_heatmap(
     if show_colorbar:
         cbar = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.01)
         cbar.set_label("Transported mass")
-    
 
     if tight_layout and (ax is None):
-        # only do this for standalone figures you created here
         plt.tight_layout()
 
     return fig, ax, masses
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import linear_sum_assignment
+
+def plot_slices_horizontal_centered(
+    adata_list,
+    obs_key,
+    coord_keys=("x", "y"),
+    obsm_key="spatial",
+    order_key=None,
+    order_map=None,
+    x_gap=None,
+    y_scale=1.0,
+    s=6,
+    alpha=0.9,
+    figsize=None,
+    legend=True,
+    legend_ncol=None,
+    legend_loc="center left",
+    legend_bbox=(1.02, 0.5),
+    legend_font=7,
+    show_ari=None,
+    # --- NEW ---
+    truth_key=None,
+    align_colors=True,
+    truth_cmap="Set3",
+    unmatched_cmap="tab20c",
+    return_alignment=False,
+):
+    """
+    Plot multiple spatial slices in one scatter plot, centered per-slice at (0,0) and arranged
+    left-to-right by adding an x-shift to each slice.
+
+    NEW:
+      - truth_key + align_colors=True aligns cluster labels (obs_key) to truth labels (truth_key)
+        via Hungarian assignment on the global contingency table aggregated across slices.
+      - Colors are assigned by truth label palette; each cluster inherits its matched truth color.
+      - cat_order is ordered by truth label order (then unmatched clusters at end).
+
+    Parameters (new)
+    ----------------
+    truth_key : str or None
+        adata.obs column containing "ground truth" labels for alignment.
+    align_colors : bool
+        If True and truth_key is provided, align cluster colors/order to truth.
+    truth_cmap : str
+        Matplotlib colormap name for truth labels (muted palettes like "Set3" recommended).
+    unmatched_cmap : str
+        Colormap for clusters that cannot be matched (when #clusters > #truth labels).
+    return_alignment : bool
+        If True, return (fig, ax, alignment_dict, contingency_df).
+
+    Returns
+    -------
+    fig, ax  (and optionally alignment outputs)
+    """
+
+    # -------------------------
+    # helper: extract coords
+    # -------------------------
+    def _get_xy(ad):
+        xk, yk = coord_keys
+        if xk in ad.obs.columns and yk in ad.obs.columns:
+            xy = ad.obs[[xk, yk]].to_numpy()
+        elif obsm_key in ad.obsm_keys():
+            xy = np.asarray(ad.obsm[obsm_key])[:, :2]
+        else:
+            raise KeyError(
+                f"Could not find coords in ad.obs[{coord_keys}] nor ad.obsm['{obsm_key}']."
+            )
+        return np.asarray(xy, dtype=np.float64)
+
+    # -------------------------
+    # decide order of slices
+    # -------------------------
+    slice_indices = list(range(len(adata_list)))
+    if order_key is not None:
+        order_vals = []
+        usable = True
+        for i, ad in enumerate(adata_list):
+            if order_key not in ad.obs.columns:
+                usable = False
+                break
+            v = pd.unique(ad.obs[order_key])
+            if len(v) != 1:
+                usable = False
+                break
+            v = v[0]
+            if order_map is not None:
+                if v not in order_map:
+                    usable = False
+                    break
+                v = order_map[v]
+            order_vals.append(v)
+        if usable:
+            slice_indices = [i for i, _ in sorted(zip(slice_indices, order_vals), key=lambda t: t[1])]
+
+    # -------------------------
+    # pass 1: gather per-slice centered coords, widths, and categories
+    # -------------------------
+    centered = []
+    widths = []
+    categories_all = []
+
+    for i in slice_indices:
+        ad = adata_list[i]
+        xy = _get_xy(ad)
+        xy = xy - xy.mean(axis=0, keepdims=True)
+        xy[:, 1] *= float(y_scale)
+
+        if obs_key not in ad.obs.columns:
+            raise KeyError(f"obs_key='{obs_key}' not found in adata.obs for slice index {i}.")
+
+        c = ad.obs[obs_key]
+        c = c.astype("category") if not pd.api.types.is_categorical_dtype(c) else c
+        categories_all.extend(list(c.cat.categories))
+
+        w = float(np.nanmax(xy[:, 0]) - np.nanmin(xy[:, 0]))
+        widths.append(w)
+
+        centered.append((xy, c, ad))
+
+    if x_gap is None:
+        med_w = np.median([w for w in widths if np.isfinite(w) and w > 0]) if len(widths) else 1.0
+        x_gap = 1.2 * (med_w if np.isfinite(med_w) and med_w > 0 else 1.0)
+
+    # -------------------------
+    # global category set (stable by first appearance) as fallback
+    # -------------------------
+    cat_order_fallback = []
+    seen = set()
+    for cat in categories_all:
+        if cat not in seen:
+            seen.add(cat)
+            cat_order_fallback.append(cat)
+
+    # -------------------------
+    # NEW: alignment to truth for colors/order
+    # -------------------------
+    # ---- inside your function, replace the alignment block with this ----
+    alignment = None
+    contingency = None
+    if align_colors and (truth_key is not None) and (obs_key == truth_key):
+        # No matching needed; keep a stable order and a single palette.
+        # Choose ONE palette policy and use it for both aligned/non-aligned.
+        cat_order = cat_order_fallback  # or: list(pd.Categorical(...).categories) if you prefer
+        cmap = plt.get_cmap(truth_cmap)  # or "tab20" if that’s what you want everywhere
+        color_map = {cat: cmap(i % getattr(cmap, "N", 20)) for i, cat in enumerate(cat_order)}
+        alignment = {cat: cat for cat in cat_order}
+        contingency = None
+    elif align_colors and (truth_key is not None):
+        for i in slice_indices:
+            if truth_key not in adata_list[i].obs.columns:
+                raise KeyError(f"truth_key='{truth_key}' not found in adata.obs for slice index {i}.")
+
+        clusters_global = []
+        truths_global = []
+        contingency = None
+
+        for i in slice_indices:
+            ad = adata_list[i]
+            tab, c_cats, t_cats = _safe_crosstab(ad, obs_key, truth_key)
+
+            # update global category unions (preserve first-seen order)
+            for x in c_cats:
+                if x not in clusters_global:
+                    clusters_global.append(x)
+            for x in t_cats:
+                if x not in truths_global:
+                    truths_global.append(x)
+
+            if contingency is None:
+                contingency = tab.copy()
+            else:
+                contingency = contingency.add(tab, fill_value=0)
+
+        # reindex to full unions and FORCE numeric fill
+        contingency = contingency.reindex(index=clusters_global, columns=truths_global, fill_value=0.0)
+        contingency = contingency.fillna(0.0)  # CRITICAL
+        contingency = contingency.astype(float)
+
+        M = contingency.to_numpy()
+        # sanitize any remaining weirdness
+        M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # if everything is zero (e.g., all labels were NaN and dropped), fall back safely
+        if M.sum() <= 0:
+            # fall back: stable order by appearance (or by cluster size if you prefer)
+            cat_order = cat_order_fallback
+            cmap = plt.get_cmap("tab20")
+            color_map = {cat: cmap(j % cmap.N) for j, cat in enumerate(cat_order)}
+            alignment = {cat: None for cat in cat_order}
+        else:
+            cost = -M
+            row_ind, col_ind = linear_sum_assignment(cost)
+
+            clusters = list(contingency.index)
+            truths = list(contingency.columns)
+
+            alignment = {cl: None for cl in clusters}
+            for r, c in zip(row_ind, col_ind):
+                alignment[clusters[r]] = truths[c]
+
+            truth_rank = {t: k for k, t in enumerate(truths)}
+            cat_order = sorted(clusters, key=lambda cl: (truth_rank.get(alignment.get(cl), 10**9), str(cl)))
+
+            # colors: cluster inherits matched truth color; unmatched get fallback
+            def _make_palette(labels, cmap_name):
+                cmap = plt.get_cmap(cmap_name)
+                N = getattr(cmap, "N", 12)
+                return {lab: cmap(j % N) for j, lab in enumerate(labels)}
+
+            truth_palette = _make_palette(truths, truth_cmap)
+            fallback_cmap = plt.get_cmap(unmatched_cmap)
+            fallback_N = getattr(fallback_cmap, "N", 20)
+
+            color_map = {}
+            k_un = 0
+            for cl in cat_order:
+                mt = alignment.get(cl, None)
+                if (mt is not None) and (mt in truth_palette):
+                    color_map[cl] = truth_palette[mt]
+                else:
+                    color_map[cl] = fallback_cmap(k_un % fallback_N)
+                    k_un += 1
+    else:
+        # fallback: tab20, stable by appearance
+        cat_order = cat_order_fallback
+        cmap = plt.get_cmap("tab20")
+        color_map = {cat: cmap(i % cmap.N) for i, cat in enumerate(cat_order)}
+
+    # -------------------------
+    # plot
+    # -------------------------
+    n = len(centered)
+    if figsize is None:
+        figsize = (max(8, 3.0 * n), 6)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    xmin, xmax = np.inf, -np.inf
+    ymin, ymax = np.inf, -np.inf
+
+    x_shift = 0.0
+    handles = {}
+
+    for (xy, c, ad), w in zip(centered, widths):
+        x = xy[:, 0] + x_shift
+        y = xy[:, 1]
+
+        xmin = min(xmin, np.nanmin(x))
+        xmax = max(xmax, np.nanmax(x))
+        ymin = min(ymin, np.nanmin(y))
+        ymax = max(ymax, np.nanmax(y))
+
+        # enforce global order (some cats may not appear in this slice)
+        cats = pd.Categorical(c, categories=cat_order)
+
+        for cat in pd.unique(cats):
+            mask = (cats == cat)
+            if not np.any(mask):
+                continue
+            sc = ax.scatter(
+                x[mask],
+                y[mask],
+                s=s,
+                alpha=alpha,
+                c=[color_map[cat]],
+                linewidths=0,
+                label=str(cat),
+            )
+            if cat not in handles:
+                handles[cat] = sc
+
+        x_shift += (w + x_gap)
+
+    # padding
+    pad_frac = 0.02
+    xr = xmax - xmin
+    yr = ymax - ymin
+    xpad = pad_frac * xr if xr > 0 else 1.0
+    ypad = pad_frac * yr if yr > 0 else 1.0
+
+    ax.set_xlim(xmin - xpad, xmax + xpad)
+    ax.set_ylim(ymin - ypad, ymax + ypad)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+
+    if legend:
+        leg_handles = [handles[cat] for cat in cat_order if cat in handles]
+        leg_labels = [str(cat) for cat in cat_order if cat in handles]
+
+        n_items = len(leg_labels)
+        ncol = min(n_items, 14) if legend_ncol is None else legend_ncol
+
+        fig.legend(
+            leg_handles,
+            leg_labels,
+            loc=legend_loc,
+            bbox_to_anchor=legend_bbox,
+            ncol=ncol,
+            frameon=False,
+            fontsize=legend_font,
+            handlelength=0.8,
+            handletextpad=0.3,
+            columnspacing=0.8,
+            borderaxespad=0.0,
+            markerscale=5,
+        )
+        fig.subplots_adjust(top=0.88)
+
+    plt.subplots_adjust(top=0.85)
+    fig.tight_layout()
+
+    if return_alignment:
+        return fig, ax, alignment, contingency
+    return fig, ax
+
+
+
+def _safe_crosstab(ad, cluster_key, truth_key):
+    df = ad.obs[[cluster_key, truth_key]].copy()
+    df = df.dropna(subset=[cluster_key, truth_key])  # CRITICAL
+    cser = df[cluster_key].astype("category") if not pd.api.types.is_categorical_dtype(df[cluster_key]) else df[cluster_key]
+    tser = df[truth_key].astype("category") if not pd.api.types.is_categorical_dtype(df[truth_key]) else df[truth_key]
+    tab = pd.crosstab(cser, tser)
+    return tab, list(cser.cat.categories), list(tser.cat.categories)

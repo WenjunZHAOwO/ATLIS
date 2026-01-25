@@ -16,8 +16,8 @@ from Solve_Slice_test import solve_V_all_slices, find_B_music, select_informativ
 # -----------------------------
 # Data prep (yours, minimal edits)
 # -----------------------------
-def prepare_data(threshold=1.25, return_sc=False):
-    fname = "../../Data/MOSTA/Dorsal_midbrain_cell_bin.h5ad"
+def prepare_data(threshold=1.25, return_sc=False, fname="../../Data/MOSTA/Dorsal_midbrain_cell_bin.h5ad"):
+    # fname = "../../Data/MOSTA/Dorsal_midbrain_cell_bin.h5ad"
     adata = sc.read_h5ad(fname)
     adata.X = adata.layers["counts"].copy()
 

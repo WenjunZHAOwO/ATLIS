@@ -485,3 +485,290 @@ def impute_slice_gw_with_projection(
         )
 
     return X_t_hat
+
+
+import numpy as np
+import ot
+
+from sklearn.metrics import pairwise_distances
+
+def fps_sklearn(X, n_max=1000, random_state=0):
+    n = X.shape[0]
+    rng = np.random.RandomState(random_state)
+
+    idx = np.empty(n_max, dtype=int)
+    idx[0] = rng.randint(n)
+
+    dist = pairwise_distances(X, X[idx[0]][None, :]).ravel()
+
+    for k in range(1, n_max):
+        idx[k] = np.argmax(dist)
+        dist = np.minimum(
+            dist,
+            pairwise_distances(X, X[idx[k]][None, :]).ravel()
+        )
+
+    return idx
+
+
+def _downsample_pair(X, Y=None, n_max=None, rng=None):
+    """
+    Downsample rows of X and Y together to at most n_max points.
+    Keeps alignment. Returns (X_ds, Y_ds).
+    """
+    if n_max is None or X.shape[0] <= n_max:
+        return X, Y
+    if rng is None:
+        rng = np.random.default_rng(0)
+    idx = fps_sklearn(X, n_max=n_max)
+    # idx = rng.choice(X.shape[0], size=int(n_max), replace=False)
+
+
+    if Y is None:
+        return X[idx]
+    else:
+        return X[idx], Y[idx]
+
+def compare_imputation_midpoint(adata_insamp, V, pd_B, i, n_end=1000, type_id=-1, depth=4):
+    """
+    depth controls how fine the recursive refinement is:
+      depth=1 -> t in {0.5}
+      depth=2 -> t in {0.25, 0.5, 0.75}
+      depth=3 -> t in {0.125, 0.25, ..., 0.875}
+    """
+
+    def coords(ad):
+        return ad.obs[["x", "y"]].to_numpy(dtype=float)
+
+    eps = 1e0
+    ad0, adt, ad1 = adata_insamp[i - 1], adata_insamp[i], adata_insamp[i + 1]
+
+    V0 = np.asarray(V[i - 1], float)
+    Vt = np.asarray(V[i], float)
+    V1 = np.asarray(V[i + 1], float)
+
+    X0 = coords(ad0)
+    Xt = coords(adt)
+    X1 = coords(ad1)
+
+    # keep your original containers
+    X_all = [[X0], [Xt], [X1]]
+    V_all = [[V0], [Vt], [V1]]
+
+
+
+    # Downsample endpoints once for speed
+    X0_prop_ds, Y0_prop_ds = _downsample_pair(X0, V0, n_max=n_end)
+    X1_prop_ds, Y1_prop_ds = _downsample_pair(X1, V1, n_max=n_end)
+
+    # ---------- Option (2): recursive midpoint refinement ----------
+    # Store nodes keyed by exact dyadic t as integers to avoid float-key issues:
+    # represent t = k / 2^depth by integer k in [0, 2^depth]
+    L = int(depth)
+    denom = 2**L
+
+    # nodes[k] = (Xk, Yk, Ck) where t = k/denom
+    nodes = {}
+    nodes[0] = (X0_prop_ds, Y0_prop_ds, ot.dist(X0_prop_ds, X0_prop_ds))
+    nodes[denom] = (X1_prop_ds, Y1_prop_ds, ot.dist(X1_prop_ds, X1_prop_ds))
+
+    def _midpoint_node(left_k, right_k):
+        """Compute node at mid_k = (left_k+right_k)//2 using parents at t=0.5."""
+        mid_k = (left_k + right_k) // 2
+        if mid_k in nodes:
+            return mid_k
+
+        Xl, Yl, _ = nodes[left_k]
+        Xr, Yr, _ = nodes[right_k]
+
+        Xbar, _, Ybar, Cbar, _ = impute_slice_fgw_barycenter(
+            X0=Xl, Y0=Yl,
+            X1=Xr, Y1=Yr,
+            t=0.5,                 # midpoint interpolation
+            N_bary=n_end,
+            alpha=0.5,
+            pd_B=pd_B,
+            Y_is_proportion=True,
+        )
+        nodes[mid_k] = (Xbar, Ybar, Cbar)
+        return mid_k
+
+    # Build dyadic points by recursively splitting intervals
+    intervals = [(0, denom)]
+    for _ in range(L):  # each level splits all current intervals
+        new_intervals = []
+        for a, b in intervals:
+            print('a='+str(a)+',b='+str(b))
+            if b - a <= 1:
+                continue
+            m = _midpoint_node(a, b)
+            new_intervals.append((a, m))
+            new_intervals.append((m, b))
+        intervals = new_intervals
+
+    # Now evaluate GW distance for all interior dyadic points
+    # (you can include endpoints too if you want, but typically exclude 0 and 1)
+    ks = sorted([k for k in nodes.keys() if 0 < k < denom])
+    t_grid = [0] + [k / denom for k in ks] + [1]
+
+    gw_dists = []
+    best_gw = np.inf
+    best_t = None
+    best_Xbar = None
+    best_Ybar = None
+    best_Cbar = None
+
+    # target geometry cost (fixed)
+
+    q = np.ones(Xt.shape[0]) / Xt.shape[0]
+    X_all += [X0_prop_ds]
+    V_all += [Y0_prop_ds]
+
+    C2 = ot.dist(Xt, Xt)
+    C1 = ot.dist(X0_prop_ds, X0_prop_ds)
+    C1 = C1 / (C2.max() + 1e-12)  # consistent scaling with your previous code pattern
+    C2 = C2 / (C2.max() + 1e-12)
+
+    p = np.ones(C1.shape[0]) / C1.shape[0]
+    gw = ot.gromov.gromov_wasserstein2(C1, C2, p, q, loss_fun="square_loss")
+    gw_dists.append(gw)
+
+    for k in ks:
+        t = k / denom
+        print(f"t = {t:.6f}")
+
+        Xbar, Ybar, Cbar = nodes[k]
+        
+        # keep for plotting (same as your earlier usage: append arrays, not nested)
+        X_all += [Xbar]
+        V_all += [Ybar]
+
+        # GW distance to evaluation slice
+        C2 = ot.dist(Xt, Xt)
+        C1 = Cbar
+        C1 = C1 / (C2.max() + 1e-12)  # consistent scaling with your previous code pattern
+        C2 = C2 / (C2.max() + 1e-12)
+
+        p = np.ones(Xbar.shape[0]) / Xbar.shape[0]
+        gw = ot.gromov.gromov_wasserstein2(C1, C2, p, q, loss_fun="square_loss")
+
+        gw_dists.append(gw)
+        print("GW =", gw)
+
+        if gw < best_gw:
+            best_gw = gw
+            best_t = float(t)
+            best_Xbar = Xbar
+            best_Ybar = Ybar
+            best_Cbar = Cbar
+    X_all += [X1_prop_ds]
+    V_all += [Y1_prop_ds]
+    C2 = ot.dist(Xt, Xt)
+    C1 = ot.dist(X1_prop_ds, X1_prop_ds)
+    C1 = C1 / (C2.max() + 1e-12)  # consistent scaling with your previous code pattern
+    C2 = C2 / (C2.max() + 1e-12)
+
+    p = np.ones(C1.shape[0]) / C1.shape[0]
+    gw = ot.gromov.gromov_wasserstein2(C1, C2, p, q, loss_fun="square_loss")
+    gw_dists.append(gw)
+
+
+
+    return X_all, V_all, t_grid, gw_dists
+
+
+import numpy as np
+
+def _rot2(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s],
+                     [s,  c]])
+
+def _pca_angle(X):
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = (Xc.T @ Xc) / max(len(Xc) - 1, 1)
+    vals, vecs = np.linalg.eigh(S)
+    v = vecs[:, np.argmax(vals)]
+    return float(np.arctan2(v[1], v[0]))
+
+def _chamfer(A, B):
+    A = np.asarray(A, float)
+    B = np.asarray(B, float)
+    d = ((A[:, None, :] - B[None, :, :])**2).sum(axis=2)
+    return float(d.min(axis=1).mean() + d.min(axis=0).mean())
+
+def pca_align_then_temporal_flip(X, X_prev_aligned=None, fix_scale=False, return_info=False):
+    """
+    PCA-align X (center + rotate) then resolve the 4-way ambiguity by choosing
+    the candidate that is closest to the previous aligned slice X_prev_aligned.
+    If X_prev_aligned is None, returns PCA-aligned (no flip decision).
+    """
+    X = np.asarray(X, float)
+
+    # center + optional scale
+    c = X.mean(axis=0, keepdims=True)
+    Xc = X - c
+    s = 1.0
+    if fix_scale:
+        s = np.sqrt((Xc**2).sum(axis=1).mean()) + 1e-12
+        Xc = Xc / s
+
+    # PCA rotate so PC1 is horizontal
+    theta = _pca_angle(Xc)
+    Xp = Xc @ _rot2(-theta).T
+
+    # if no previous, do nothing further
+    if X_prev_aligned is None:
+        X_out = (Xp * s + c) if fix_scale else (Xp + c)
+        if not return_info:
+            return X_out
+        return X_out, {"theta_rad": theta, "chosen_flip": (1.0, 1.0), "used_prev": False}
+
+    # build 4 candidates: identity, flip-x, flip-y, flip-both (== 180°)
+    flips = [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)]
+    cands = [Xp * np.array([fx, fy]) for fx, fy in flips]
+
+    # compare in the same normalization as output
+    # (centered; scale-normalized if fix_scale)
+    prev = np.asarray(X_prev_aligned, float)
+    prevc = prev - prev.mean(axis=0, keepdims=True)
+    if fix_scale:
+        prevs = np.sqrt((prevc**2).sum(axis=1).mean()) + 1e-12
+        prevc = prevc / prevs
+
+    dists = [_chamfer(C, prevc) for C in cands]
+    best = int(np.argmin(dists))
+    Xbest = cands[best]
+    fx, fy = flips[best]
+
+    # unscale/uncenter back to original frame (or keep centered if you prefer)
+    X_out = Xbest
+    if fix_scale:
+        X_out = X_out * s
+    X_out = X_out + c
+
+    if not return_info:
+        return X_out
+
+    return X_out, {
+        "theta_rad": float(theta),
+        "chosen_flip": (float(fx), float(fy)),
+        "used_prev": True,
+        "dists_to_prev": list(map(float, dists)),
+    }
+
+
+def rotate_points(XY, angle_deg, center=None):
+    theta = np.deg2rad(angle_deg)
+    R = np.array([[np.cos(theta), -np.sin(theta)],
+                  [np.sin(theta),  np.cos(theta)]])
+
+    if center is not None:
+        XY = XY - np.asarray(center)
+
+    XY_rot = XY @ R.T
+
+    if center is not None:
+        XY_rot = XY_rot + np.asarray(center)
+
+    return XY_rot

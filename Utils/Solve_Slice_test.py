@@ -489,54 +489,16 @@ def laplacian_from_coords(x, y, k=20, mutual=False, normed=False, return_dense=F
         return L.toarray(), W.toarray()
     return L, W
 
-import numpy as np
-
-def proj_simplex_rows(V, z=1.0, proj=False):
-    """
-    Project each row of M onto the simplex { x : x >= 0, sum(x) = z }.
-
-    Parameters
-    ----------
-    V : array_like, shape (n_rows, n_cols)
-        Input matrix; each row will be projected.
-    z : float, optional
-        Sum constraint for each row (default 1.0).
-
-    Returns
-    -------
-    X : ndarray, shape (n_rows, n_cols)
-        Row-wise simplex projections.
-    """
-    V = np.asarray(V, dtype=float)
-    n, m = V.shape
-    if proj == True:
-        # sort each row in descending order
-        U = -np.sort(-V, axis=1)                        # (n, m)
-        cssv = np.cumsum(U, axis=1)                     # row-wise cumsum
-    
-        # find rho per row: largest j s.t. u_j * (j+1) > cssv_j - z
-        j = np.arange(1, m+1)
-        cond = (U * j) > (cssv - z)                     # (n, m) boolean
-        rho = cond.sum(axis=1) - 1                      # (n,) index
-    
-        # theta per row
-        theta = (cssv[np.arange(n), rho] - z) / (rho + 1.0)  # (n,)
-    
-        # projection
-        X = V - theta[:, None]
-    else:
-        
-        
-        X = V #* (V>0)
-    np.maximum(X, 0.0, out=X)
-    return X
 
 
 
 
 
 
-def solve_V_per_slice(adata, pd_B, lam=10, k=20, n_top=2000, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=False, return_obj=False, proj_simplex=False, step_rate='backtrack'):
+
+
+
+def solve_V_per_slice(adata, pd_B, lam=10, k=20, n_top=2000, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, return_obj=False, proj_simplex=False, step_rate='backtrack'):
     # stop
     
     gene_names = adata.var_names
@@ -556,104 +518,131 @@ def solve_V_per_slice(adata, pd_B, lam=10, k=20, n_top=2000, niter_max=1e3, tol=
     # X = adata_sub.X.T
     X = adata_sub.layers['counts'].T if 'counts' in adata_sub.layers else adata_sub.X.T
     return solve_V_universal(X,B,L,niter_max=niter_max, tol=tol, eta = eta, verbose=verbose, return_obj=return_obj, proj_simplex=proj_simplex,step_rate = step_rate)
+import numpy as np
+from scipy import sparse
 
-def solve_V_universal(X,B,L, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=False, V0=None, return_obj=False, eps_norm=1e-12, proj_simplex=False, step_rate='backtrack'):
-    if verbose:
-        print(X.T.shape)
-        print(B.shape)
-    rng = np.random.default_rng(0)
-    # --- Column-normalize X and B so each "cell" (column) sums to 1 ---
-    # X = _normalize_cols(X, eps=eps_norm)   # shape (d, n)
-    # B = _normalize_cols(B, eps=eps_norm)   # shape (d, r)
+def solve_V_universal(
+    X, B, L,
+    niter_max=1e3, tol=1e-5, eta=1e-3, verbose=True,
+    V0=None, return_obj=False, eps_norm=1e-12,
+    proj_simplex=False, step_rate='backtrack'
+):
+    # Ensure sparse formats (cheap if already sparse)
+    X = X.tocsr() if sparse.issparse(X) else np.asarray(X)
+    B = B.tocsr() if sparse.issparse(B) else np.asarray(B)
+    L = L.tocsr() if sparse.issparse(L) else np.asarray(L)
 
-    G = X.T @ B
-    H = B.T @ B
-    rng = np.random.default_rng(0)
+    # Shapes
+    d, n = X.shape
+    dB, r = B.shape
+    assert d == dB, f"X is {X.shape}, B is {B.shape} (dim mismatch)"
 
-    d, n = X.shape[0], X.shape[1]
-    r = B.shape[1]
-    if V0 is None:
-        V = rng.random((n, r))
+    # Precompute Gram terms
+    # G = X^T B  (n x r)
+    # H = B^T B  (r x r)
+    # For sparse, these are fine; convert to dense arrays for fast dense ops.
+    G = (X.T @ B)
+    H = (B.T @ B)
+
+    if sparse.issparse(G): G = G.toarray()
+    if sparse.issparse(H): H = H.toarray()
+
+    # Precompute ||X||_F^2 once (for exact objective)
+    if sparse.issparse(X):
+        xnorm2 = float(X.multiply(X).sum())
     else:
-        V = V0
-    # V = V / V.sum(axis=1, keepdims=True)
+        xnorm2 = float(np.sum(X * X))
 
-    
+    rng = np.random.default_rng(0)
 
+    # Initialize V (n x r), dense
+    if V0 is None:
+        V = rng.random((n, r), dtype=float)
+    else:
+        V = np.asarray(V0, dtype=float)
+        assert V.shape == (n, r)
+
+    # ----- Sparse-safe objective (no residual matrix) -----
+    # ||X - B V^T||_F^2 = ||X||_F^2 - 2 tr(V^T G) + tr(V^T V H)
+    # regularizer = tr(V^T L V) = sum_ij V_ij * (L V)_ij
     def objective(V):
-        R = X - B @ V.T
-        R = np.asarray(R)
-        return np.sum(R*R) + np.trace(V.T @ L @ V)
-    
-    def deriv_objective(V, H, G):
-        return 2*(V @ H - G) + 2*L@V
-    
+        # data term
+        VH = V @ H                          # (n x r), dense
+        data = xnorm2 - 2.0 * np.sum(V * G) + np.sum(VH * V)
+
+        # reg term
+        LV = L @ V                          # sparse@dense -> dense ndarray
+        reg = np.sum(LV * V)
+
+        return data + reg
+
+    # Gradient: 2(VH - G) + 2(LV)
+    def deriv_objective(V):
+        return 2.0 * (V @ H - G) + 2.0 * (L @ V)
 
     f_prev = objective(V)
+
     for it in range(int(niter_max)):
-        g = deriv_objective(V, H, G)   # gradient
-        V0 = V.copy()
+        g = deriv_objective(V)
+        V_old = V
 
         if step_rate == 'backtrack':
-            step = eta   # start with base step each iteration
-            
+            step = float(eta)
+
+            # Precompute ||g||_F^2 once for Armijo
+            gnorm2 = float(np.sum(g * g))
+
             while True:
-                # candidate update
-                V_trial = proj_simplex_rows(V0 - step * g, z=1.0, proj=proj_simplex)
+                V_trial = proj_simplex_rows(V_old - step * g, z=1.0, proj=proj_simplex)
                 f_trial = objective(V_trial)
 
-                # Armijo condition (sufficient decrease)
-                # here alpha is small (e.g. 1e-4)
-                if f_trial <= f_prev - 1e-4 * step * np.sum(g*g):
+                if f_trial <= f_prev - 1e-4 * step * gnorm2:
                     V = V_trial
                     f_curr = f_trial
                     break
+
                 step *= 0.5
-                if step < 1e-8:  # step too small, give up
+                if step < 1e-8:
                     V = V_trial
                     f_curr = f_trial
                     break
+
         elif step_rate == 'automatic':
-            
+            # This heuristic assumes L is diagonal-dominant; use diagonal only
+            dL = L.diagonal() if sparse.issparse(L) else np.diag(L)
+            DV = dL[:, None] * V_old
 
-            d = L.diagonal()              # shape (428,)
-            DV0 = d[:, None] * V0         # shape (428, K)
-
-            step = V0 / 2 / (V0 @ H + DV0 + 1e-15)
-            
-            
-            V = V0 - step * g
-            
+            step_mat = V_old / (2.0 * (V_old @ H + DV + 1e-15))
+            V = V_old - step_mat * g
             f_curr = objective(V)
+            step = float(np.mean(step_mat))
+        else:
+            raise ValueError("step_rate must be 'backtrack' or 'automatic'")
 
-            step = np.mean(step)
-            # print(f_curr)
-            # stop
-
-            
-
-        # stopping checks
         rel_drop = (f_prev - f_curr) / max(1.0, abs(f_prev))
+
         if verbose and (it % 50 == 0 or rel_drop < tol):
             if step_rate == 'backtrack':
                 print(f"iter {it:4d}  f={f_curr:.6e}  rel_drop={rel_drop:.3e}  step={step:.2e}")
-            elif step_rate == 'automatic':
+            else:
                 print(f"iter {it:4d}  f={f_curr:.6e}  rel_drop={rel_drop:.3e}  mean step={step:.2e}")
 
-        if verbose and f_curr <= f_prev and rel_drop < tol:
-            print("stopped after iteration #", it)
+        if f_curr <= f_prev and rel_drop < tol:
+            if verbose:
+                print("stopped after iteration #", it)
             break
 
         f_prev = f_curr
-    if verbose:
-        print('stopped after iteration #'+str(it))
-    if return_obj == False:
+
+    if not return_obj:
         return V
     else:
-        R = X - B @ V.T
-        R = np.asarray(R)
-        
-        return V, np.trace(V.T @ L @ V), np.sum(R*R)
+        # Return exact split (still no residual formation)
+        VH = V @ H
+        data_term = xnorm2 - 2.0 * np.sum(V * G) + np.sum(VH * V)
+        reg_term = np.sum((L @ V) * V)
+        return V, reg_term, data_term
+
         
 
 
@@ -661,205 +650,269 @@ def solve_V_universal(X,B,L, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=False,
 
 import anndata as ad
 import ot
+import numpy as np
+import scipy.sparse as sp
+import scipy.spatial
 
-def solve_V_all_slices(adata_group, pd_B, lam=10, mu=1, time=None, outer_max=5, niter_max=1e3, tol=1e-5, eta = 1e-3, verbose=True, coupling=None, k=10,init='per_slice', 
-V_init=None, ot_solver='fgw', one_step=True, step_rate='automatic', alpha=0.9):
-    # stop
+def solve_V_all_slices(
+    adata_group, pd_B,
+    lam=10, mu=1, time=None,
+    outer_max=5, niter_max=1e3, tol=1e-5, eta=1e-3,
+    verbose=True, coupling=None, k=10, init="per_slice",
+    V_init=None, ot_solver="fgw", one_step=True,
+    step_rate="automatic", alpha=0.9,
+    dtype=np.float32,
+):
+    """
+    Sparse-safe rewrite: never materializes R = X - B V^T.
+    Assumes:
+      - adata_group[i].X can be sparse (recommended).
+      - laplacian_from_coords returns sparse (recommended).
+      - assemble_blocks returns a scipy.sparse matrix.
+      - solve_V_universal is the SPARSE-SAFE version (no residual build).
+    Notes:
+      - V is dense by design.
+      - OT coupling still forms dense C and dense pi (can dominate memory).
+    """
+
     rng = np.random.default_rng(0)
     n_times = len(adata_group)
+
+    # offsets into stacked V
     n_spots = [0]
-    for i in range(len(adata_group)):
-        n_spots += [n_spots[-1]+adata_group[i].shape[0]]
-    
-    adata = ad.concat(adata_group, axis=0, join="outer")#, label="batch", keys=time)
-    
+    for i in range(n_times):
+        n_spots.append(n_spots[-1] + adata_group[i].shape[0])
 
+    # concatenate and intersect genes
+    adata = ad.concat(adata_group, axis=0, join="outer")
     gene_names = adata.var_names
-
     common = gene_names.intersection(pd_B.columns)
-  
+
     adata_sub = adata[:, common].copy()
     for i in range(n_times):
-        adata_group[i] = adata_group[i][:,common].copy()
+        adata_group[i] = adata_group[i][:, common].copy()
     pd_B_sub = pd_B[common]
-    
 
-    diag_blocks = [0]*n_times
+    # time rescaling
+    if time is None:
+        time = list(range(n_times))
+    if time[-1] == time[0]:
+        rescaled_time = [0.0 for _ in time]
+    else:
+        rescaled_time = [(t - time[0]) / (time[-1] - time[0]) for t in time]
+
+    # build spatial Laplacians (diag blocks)
+    diag_blocks = [None] * n_times
     for i in range(n_times):
-        x = adata_group[i].obs['x'].to_numpy()
-        y = adata_group[i].obs['y'].to_numpy()
-        diag_blocks[i], _ = laplacian_from_coords(x, y, k=k, normed=True)
-        diag_blocks[i] = diag_blocks[i]*lam
+        x = adata_group[i].obs["x"].to_numpy()
+        y = adata_group[i].obs["y"].to_numpy()
+        Li, _ = laplacian_from_coords(x, y, k=k, normed=True)  # should be sparse
+        if not sp.issparse(Li):
+            Li = sp.csr_matrix(Li)
+        diag_blocks[i] = (lam * Li).tocsr()
 
-    B = pd_B_sub.to_numpy().T
-    # X = adata_sub.X.T
-    X = adata_sub.X.T
+    # B: genes x r (dense ok), X: genes x N (prefer sparse)
+    B = np.asarray(pd_B_sub.to_numpy().T, dtype=dtype)  # genes x r
 
-    if V_init == None:
-        V_init = [0]*n_times
-        rng = np.random.default_rng(0)
+    X = adata_sub.X.T  # genes x N
+    if sp.issparse(X):
+        X = X.tocsr().astype(dtype)
+    else:
+        X = sp.csr_matrix(np.asarray(X, dtype=dtype))
+
+    # Precompute GH + ||X||^2 for sparse-safe objective evaluation
+    # G = X^T B: (N x r)
+    G = X.T @ B
+    if sp.issparse(G):
+        G = G.toarray()
+    G = np.asarray(G, dtype=dtype)
+
+    # H = B^T B: (r x r)
+    H = (B.T @ B).astype(dtype, copy=False)
+
+    # ||X||_F^2
+    xnorm2 = float(X.multiply(X).sum())
+
+    def objective_from_GH(V, L):
+        # ||X - B V^T||^2 = ||X||^2 - 2 tr(V^T G) + tr(V^T V H)
+        VH = V @ H
+        data = xnorm2 - 2.0 * float(np.sum(V * G)) + float(np.sum(VH * V))
+        LV = L @ V
+        reg = float(np.sum(LV * V))
+        return data + reg
+
+    # Initialize V per-slice if not provided
+    if V_init is None:
+        V_init = [None] * n_times
         for i in range(n_times):
-            V_init[i] = solve_V_per_slice(adata_group[i],pd_B_sub, lam=lam, k=k, eta=eta, step_rate=step_rate)
-            if init == 'random':
-                V_init[i] = rng.random((V_init[i].shape[0], V_init[i].shape[1]))
-            
-                V_init[i] = V_init[i] / V_init[i].sum(axis=1, keepdims=True)
-    
-    
-    def objective(V,L):
-        R = X - B @ V.T
-        R = np.asarray(R)
-        return np.sum(R*R) + np.trace(V.T @ L @ V)
-    
-    V = np.vstack(V_init)
+            V_i = solve_V_per_slice(
+                adata_group[i], pd_B_sub, lam=lam, k=k, eta=eta, step_rate=step_rate
+            )
+            V_i = np.asarray(V_i, dtype=dtype)
+            if init == "random":
+                V_i = rng.random(V_i.shape, dtype=float).astype(dtype)
+                V_i = V_i / (V_i.sum(axis=1, keepdims=True) + 1e-15)
+            V_init[i] = V_i
+    else:
+        # enforce dtype + list form
+        V_init = [np.asarray(Vi, dtype=dtype) for Vi in V_init]
 
+    V = np.vstack(V_init).astype(dtype, copy=False)  # (N x r)
+
+    # Outer loop control
     if one_step:
         outer_max = 1
     if mu < 0:
-        # print('yeah')
-        # return V, [], []
         outer_max = -1
-    
-        
-    import scipy.sparse as sp
-    import scipy.spatial
 
-    # --- build initial block Laplacian using only spatial terms ---
-    # keep a copy of spatial-only diagonal blocks
+    # Spatial-only block Laplacian
     base_diag_blocks = [blk.copy() for blk in diag_blocks]
     L = assemble_blocks(base_diag_blocks, offdiag_blocks=[])
-    f_prev = objective(V, L)
+    if not sp.issparse(L):
+        L = sp.csr_matrix(L)
+    else:
+        L = L.tocsr()
+
+    f_prev = objective_from_GH(V, L)
+
+    # store couplings between consecutive slices
     pi = [None] * (n_times - 1)
 
-
-
     for iter_outer in range(outer_max):
-        # reset diag_blocks to spatial-only each outer iteration
+        # reset to spatial-only
         diag_blocks = [blk.copy() for blk in base_diag_blocks]
         off_diag_blocks = []
 
+        # compute couplings, update blocks
         for i in range(n_times - 1):
-            n_i  = adata_group[i].obs.shape[0]
-            n_ip = adata_group[i+1].obs.shape[0]
+            n_i = adata_group[i].n_obs
+            n_ip = adata_group[i + 1].n_obs
 
-            # uniform marginals
-            a = np.ones(n_i)  / n_i
-            b = np.ones(n_ip) / n_ip
-
-            # squared Euclidean cost in V-space
-            C = scipy.spatial.distance.cdist(
-                V_init[i], V_init[i+1], metric="sqeuclidean"
-            )
+            a = np.full(n_i, 1.0 / n_i, dtype=dtype)
+            b = np.full(n_ip, 1.0 / n_ip, dtype=dtype)
 
             if coupling is None:
-                # (C1, C2 currently unused; keep or remove depending on future FGW use)
+                # WARNING: cdist forms dense (n_i x n_ip) cost matrix
+                C = scipy.spatial.distance.cdist(
+                    V_init[i].astype(np.float64, copy=False),
+                    V_init[i + 1].astype(np.float64, copy=False),
+                    metric="sqeuclidean",
+                )
+
+                # spatial costs for FGW (also dense)
                 x = adata_group[i].obs["x"].to_numpy()
                 y = adata_group[i].obs["y"].to_numpy()
                 C1 = ot.dist(np.vstack((x, y)).T)
 
-                x = adata_group[i+1].obs["x"].to_numpy()
-                y = adata_group[i+1].obs["y"].to_numpy()
+                x = adata_group[i + 1].obs["x"].to_numpy()
+                y = adata_group[i + 1].obs["y"].to_numpy()
                 C2 = ot.dist(np.vstack((x, y)).T)
-                C = C / C.max()
-                C1 = C1 / C1.max()
-                C2 = C2 / C2.max()
-                # pi[i] = ot.sinkhorn(a, b, C, reg=1e-2)
-                
-                if ot_solver == 'fgw':
-                    pi[i], log = fused_gromov_wasserstein(
-                        C, C1, C2,
-                        a, b,
+
+                # normalize
+                C = C / (C.max() + 1e-15)
+                C1 = C1 / (C1.max() + 1e-15)
+                C2 = C2 / (C2.max() + 1e-15)
+
+                if ot_solver == "fgw":
+                    pi_i, log = fused_gromov_wasserstein(
+                        C, C1, C2, a, b,
                         loss_fun="square_loss",
                         alpha=alpha,
-                        log=True
+                        log=True,
                     )
-                    if np.std(pi[i].ravel()) < 1e-10:
-                        # pi[i] = ot.sinkhorn(a, b, C, reg=1e-2)
+                    # fallback if coupling collapses
+                    if np.std(pi_i.ravel()) < 1e-10:
                         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                        r = min(C.shape[0], C.shape[1], 100)
-                        #dtype = torch.float64
+                        rr = min(C.shape[0], C.shape[1], 100)
                         if verbose:
-                            print('constant coupling...fall back to low-rank')
-                            print(C.shape)
-                        pi[i], _ = FRLC.FRLC_opt(torch.tensor(C).to(device), A = torch.tensor(C1).to(device), B = torch.tensor(C2).to(device), alpha=alpha, device=device, r=r, min_iter=100, max_iter=100,
-                                max_inneriters_balanced=300,
-                                max_inneriters_relaxed=300,
-                                min_iterGW = 100,
-                                Wasserstein = False,
-                                FGW = True,
-                                returnFull=True,
-                                printCost=False
+                            print("constant coupling... fall back", C.shape)
+                        pi_i, _ = FRLC.FRLC_opt(
+                            torch.tensor(C, device=device),
+                            A=torch.tensor(C1, device=device),
+                            B=torch.tensor(C2, device=device),
+                            alpha=alpha, device=device, r=rr,
+                            min_iter=100, max_iter=100,
+                            max_inneriters_balanced=300,
+                            max_inneriters_relaxed=300,
+                            min_iterGW=100,
+                            Wasserstein=False, FGW=True,
+                            returnFull=True, printCost=False,
                         )
-                        
-                        
-                        pi[i] = pi[i].cpu().detach().numpy()
-                elif ot_solver=='sinkhorn':
+                        pi_i = pi_i.detach().cpu().numpy()
+
+                elif ot_solver == "sinkhorn":
                     geom_xy = PointCloud(
-                        V_init[i]   / max(np.abs(X).max() for X in V_init),
-                        V_init[i+1] / max(np.abs(X).max() for X in V_init),
-                        epsilon=0.01
+                        V_init[i]   / max(np.abs(Xj).max() for Xj in V_init),
+                        V_init[i+1] / max(np.abs(Xj).max() for Xj in V_init),
+                        epsilon=0.01,
                     )
-
-                    # geom_xy = PointCloud(
-                    #     V_init[i] / max(np.linalg.norm(X[:, None] - X[None, :], axis=-1).max() for X in V_init),
-                    #     V_init[i+1] / max(np.linalg.norm(X[:, None] - X[None, :], axis=-1).max() for X in V_init),
-                    #     epsilon=0.01
-                    # )
-
                     problem = LinearProblem(geom_xy)
                     solver = Sinkhorn()
                     out_sink = solver(problem)
+                    pi_i = np.array(out_sink.matrix)
 
-                    pi[i] = np.array(out_sink.matrix)#ot.sinkhorn(a, b, C, reg=1e-2)
-                else:
-                    
+                elif ot_solver == "sinkhorn_lr":
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    #dtype = torch.float64
-                    r = min(C.shape[0], C.shape[1], 100)
-
-                    pi[i], _ = FRLC.FRLC_opt(torch.tensor(C).to(device), A = torch.tensor(C1).to(device), B = torch.tensor(C2).to(device), alpha=alpha, device=device, r=r, min_iter=100, max_iter=100,
-                            max_inneriters_balanced=100,
-                            max_inneriters_relaxed=100,
-                            min_iterGW = 100,
-                            Wasserstein = False,
-                            FGW = True,
-                            returnFull=True,
-                            printCost=False
+                    rr = min(C.shape[0], C.shape[1], 100)
+                    pi_i, _ = FRLC.FRLC_opt(
+                        torch.tensor(C, device=device),
+                        device=device, r=rr,
+                        min_iter=100, max_iter=100,
+                        max_inneriters_balanced=300,
+                        max_inneriters_relaxed=300,
+                        min_iterGW=100,
+                        Wasserstein=True, FGW=False,
+                        returnFull=True, printCost=False,
                     )
-                    
-                    
-                    pi[i] = pi[i].cpu().detach().numpy()
+                    pi_i = pi_i.detach().cpu().numpy()
+
+                else:
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    rr = min(C.shape[0], C.shape[1], 100)
+                    pi_i, _ = FRLC.FRLC_opt(
+                        torch.tensor(C, device=device),
+                        A=torch.tensor(C1, device=device),
+                        B=torch.tensor(C2, device=device),
+                        alpha=alpha, device=device, r=rr,
+                        min_iter=100, max_iter=100,
+                        max_inneriters_balanced=100,
+                        max_inneriters_relaxed=100,
+                        min_iterGW=100,
+                        Wasserstein=False, FGW=True,
+                        returnFull=True, printCost=False,
+                    )
+                    pi_i = pi_i.detach().cpu().numpy()
+
             else:
-                pi[i] = coupling[i]
-            
-            pi[i] = pi[i] / pi[i].sum()
-            pi[i] = pi[i] * np.sqrt(pi[i].shape[0] * pi[i].shape[1])
+                pi_i = np.asarray(coupling[i], dtype=dtype)
 
-            # OT marginals (should match a,b, but recompute to be safe)
-            a_marg = pi[i].sum(axis=1)  # shape (n_i,)
-            b_marg = pi[i].sum(axis=0)  # shape (n_ip,)
+            # normalize and time-scale (keep dense unless you sparsify pi explicitly)
+            pi_i = pi_i / (pi_i.sum() + 1e-15)
+            pi_i = pi_i * np.sqrt(pi_i.shape[0] * pi_i.shape[1])
+            dt = (rescaled_time[i + 1] - rescaled_time[i])
+            if dt != 0:
+                pi_i = pi_i / dt
 
-            # --- diagonal OT contributions: mu * diag(a), mu * diag(b) ---
-            diag_blocks[i]   += mu * sp.diags(a_marg)
-            diag_blocks[i+1] += mu * sp.diags(b_marg)
+            pi[i] = pi_i
 
-            # --- off-diagonal OT coupling: -mu * pi ---
-            off_diag_blocks.append((i,   i+1, -mu * pi[i]))
-            off_diag_blocks.append((i+1, i,   -mu * pi[i].T))
+            a_marg = pi_i.sum(axis=1)  # (n_i,)
+            b_marg = pi_i.sum(axis=0)  # (n_ip,)
 
-        L0 = L.copy()
-        L  = assemble_blocks(diag_blocks, offdiag_blocks=off_diag_blocks)
+            diag_blocks[i]   = diag_blocks[i]   + mu * sp.diags(a_marg, format="csr")
+            diag_blocks[i+1] = diag_blocks[i+1] + mu * sp.diags(b_marg, format="csr")
 
+            # off-diagonal dense blocks (WARNING: makes L less sparse if pi_i is dense)
+            off_diag_blocks.append((i,   i+1, -mu * pi_i))
+            off_diag_blocks.append((i+1, i,   -mu * pi_i.T))
 
-        # plt.subplot(121)
-        # plt.imshow(L.todense())
-        # plt.clim([0, 1])
-        # plt.colorbar()
-        # plt.subplot(122)
-        # plt.imshow(L.todense() - L0.todense())
-        # plt.colorbar()
-        # plt.clim([0, 1])
+        L = assemble_blocks(diag_blocks, offdiag_blocks=off_diag_blocks)
+        if not sp.issparse(L):
+            L = sp.csr_matrix(L)
+        else:
+            L = L.tocsr()
+
         if mu > 0:
+            # IMPORTANT: solve_V_universal must be sparse-safe version
             V = solve_V_universal(
                 X, B, L,
                 niter_max=niter_max,
@@ -867,29 +920,24 @@ V_init=None, ot_solver='fgw', one_step=True, step_rate='automatic', alpha=0.9):
                 eta=eta,
                 verbose=verbose,
                 V0=V,
-                step_rate=step_rate
-            )
-            
+                step_rate=step_rate,
+            ).astype(dtype, copy=False)
 
-            # update all time-slice blocks from stacked V
+            # update per-slice views
             for i in range(n_times):
                 V_init[i] = V[n_spots[i]:n_spots[i+1], :]
 
-        # stopping checks
-        f_curr = objective(V, L)
+        f_curr = objective_from_GH(V, L)
         rel_drop = (f_prev - f_curr) / max(1.0, abs(f_prev))
+
         if verbose and (iter_outer % 50 == 0 or rel_drop < tol):
             print(f"iter {iter_outer:4d}  f={f_curr:.6e}  rel_drop={rel_drop:.3e}")
 
         if f_curr <= f_prev and rel_drop < tol:
-            print("stopped after iteration #", iter_outer)
+            if verbose:
+                print("stopped after iteration #", iter_outer)
             break
 
         f_prev = f_curr
-
-
-
-
-    
 
     return V_init, pi, L
