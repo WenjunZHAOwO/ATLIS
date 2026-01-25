@@ -12,6 +12,10 @@ You can install the released version of ATLIS from Github with the following cod
 Example usage
 ------------
 [Synthetic example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Synthetic.ipynb)
+[Mouse dorsal brain example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Mouse_dorsal_brain.ipynb)
+[Zebrafish development example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Zesta.ipynb)
+
+Data download instructions can be found within each real data notebook.
 
 
 How to cite`ATLIS`
